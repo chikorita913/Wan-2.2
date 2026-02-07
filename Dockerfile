@@ -1,7 +1,7 @@
 FROM runpod/worker-comfyui:5.7.1-base
 SHELL ["/bin/bash", "-lc"]
 
-# Tools (git for clones, ffmpeg for ffprobe mp4 validation)
+# Tools (git for clones, ffmpeg for ffprobe mp4 validation) push
 RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Use the same Python env ComfyUI runs with (prefer /opt/venv; fall back if needed)
