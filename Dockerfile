@@ -68,22 +68,25 @@ RUN set -euxo pipefail; \
     git clone https://github.com/chrisgoringe/cg-use-everywhere; \
     git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite; \
     git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts; \
-    git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+    git clone https://github.com/kijai/ComfyUI-WanVideoWrapper; \
+    git clone https://github.com/GACLove/ComfyUI-VFI
 
 # ------------------------------------------------------------
 # Install ALL custom-node requirements into the SAME venv
-# (does NOT remove torchaudio)
+# (explicitly includes VFI deps; torchaudio is preserved)
 # ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     for r in /comfyui/custom_nodes/*/requirements*.txt; do \
       if [ -f "$r" ]; then \
+        echo "Installing $r"; \
         "${VENV_PY}" -m pip install --no-cache-dir -r "$r"; \
       fi; \
     done; \
     for d in /comfyui/custom_nodes/*/requirements; do \
       if [ -d "$d" ]; then \
         while IFS= read -r -d '' f; do \
+          echo "Installing $f"; \
           "${VENV_PY}" -m pip install --no-cache-dir -r "$f"; \
         done < <(find "$d" -maxdepth 1 -type f -name '*.txt' -print0); \
       fi; \
