@@ -1,7 +1,7 @@
 FROM runpod/worker-comfyui:5.7.1-base
 SHELL ["/bin/bash", "-lc"]
 
-# Tools (git for clones, ffmpeg for ffprobe mp4 validation) pushh
+# Tools (git for clones, ffmpeg for ffprobe mp4 validation)
 RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # Use the same Python env ComfyUI runs with (prefer /opt/venv; fall back if needed)
@@ -14,8 +14,7 @@ RUN for v in ${VENV_CANDIDATES}; do \
 
 # Prove which python we will use (must match ComfyUI runtime env)
 RUN source /etc/profile.d/venv.sh \
- && which python \
- && python -c "import sys; print(sys.executable)"
+ && "${VENV_PY}" -c "import sys; print('python:', sys.executable)"
 
 # --- Install endpoint custom nodes ---
 WORKDIR /comfyui/custom_nodes
@@ -42,30 +41,27 @@ RUN source /etc/profile.d/venv.sh \
       fi; \
     done
 
-# --- FP16 fix: FORCE torch 2.7 nightly cu124 (same as manual fix) ---
+# --- FP16 + WanVideoWrapper fix: FORCE torch/torchvision/torchaudio 2.7 nightly cu124 ---
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu124
 RUN source /etc/profile.d/venv.sh \
  && "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true \
- && "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre torch --index-url ${PYTORCH_INDEX_URL} \
- && "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre torchvision --index-url ${PYTORCH_INDEX_URL} --no-deps
+ && "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre \
+      torch torchvision torchaudio \
+      --index-url ${PYTORCH_INDEX_URL}
 
-# Verify: must be cu124 + allow_fp16_accumulation exists
+# Verify: must be cu124 + allow_fp16_accumulation exists + torchaudio imports
 RUN source /etc/profile.d/venv.sh && "${VENV_PY}" - <<'EOF'
-import torch
+import torch, torchvision, torchaudio
 print("torch:", torch.__version__)
+print("torchvision:", torchvision.__version__)
+print("torchaudio:", torchaudio.__version__)
 print("cuda:", torch.version.cuda)
 assert torch.version.cuda == "12.4"
 assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
 print("OK")
 EOF
 
-# --- Override runtime scripts (repo-root files) ---
-WORKDIR /
-COPY start.sh /start.sh
-COPY handler.py /handler.py
-COPY warmup.py /warmup.py
-COPY comfy_client.py /comfy_client.py
-COPY warmup_workflow.json /warmup_workflow.json
-
-RUN chmod +x /start.sh
-CMD ["/start.sh"]
+# IMPORTANT:
+# - No COPY of start.sh/handler.py
+# - No CMD override
+# Base image will run the default RunPod ComfyUI worker.
