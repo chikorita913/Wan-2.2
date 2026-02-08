@@ -30,12 +30,9 @@ RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel; \
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
-    "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre \
-      torch \
-      --index-url "${PYTORCH_INDEX_URL}"; \
-    "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre \
-      torchvision torchaudio \
-      --index-url "${PYTORCH_INDEX_URL}" --no-deps; \
+    "${VENV_PY}" -m pip install --no-cache-dir --pre \
+      --index-url "${PYTORCH_INDEX_URL}" \
+      torch torchvision torchaudio; \
     "${VENV_PY}" - <<'PY'
 import torch
 import torchvision
@@ -77,4 +74,4 @@ RUN set -euxo pipefail; \
 
 # --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
 # (No COPY start.sh, no COPY handler.py, no CMD/ENTRYPOINT here.)
-WORKDIR /
+WORKDIR /comfyui
