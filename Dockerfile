@@ -1,15 +1,21 @@
-# Keep RunPod’s base image (includes the base start.sh / handler / entrypoint behavior)
+# Keep RunPod’s base image (includes start.sh / handler / entrypoint behavior)
 FROM runpod/worker-comfyui:5.7.1-base
 
 SHELL ["/bin/bash", "-lc"]
 
-# --- tools you actually need for your nodes/workflows ---
+# ------------------------------------------------------------
+# System tools
+# ------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ffmpeg \
+    git \
+    ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
-# --- Choose the SAME Python env ComfyUI runs with (covers /opt/venv OR /workspace/venv OR /comfyui/.venv) ---
+# ------------------------------------------------------------
+# Select the SAME Python venv ComfyUI actually uses
+# ------------------------------------------------------------
 ENV VENV_CANDIDATES="/opt/venv /workspace/venv /comfyui/.venv"
+
 RUN set -euxo pipefail; \
     rm -f /etc/profile.d/venv.sh; \
     touch /etc/profile.d/venv.sh; \
@@ -21,29 +27,43 @@ RUN set -euxo pipefail; \
       fi; \
     done; \
     source /etc/profile.d/venv.sh; \
-    test -n "${VENV_PY:-}" || (echo "No venv python found in: ${VENV_CANDIDATES}" && exit 1); \
+    test -n "${VENV_PY:-}" || (echo "No venv python found" && exit 1); \
     "${VENV_PY}" -V
 
-# --- FP16 fix (stable): replicate manual fix inside the SAME venv ComfyUI uses ---
-# NOTE: Do NOT assert torch.cuda.is_available() during docker build (build usually has no GPU access).
+# ------------------------------------------------------------
+# Base Python tooling
+# ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
-    "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel; \
+    "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel
+
+# ------------------------------------------------------------
+# Torch stack (PINNED + CUDA-matched)
+# IMPORTANT: install torchaudio and NEVER remove it later
+# ------------------------------------------------------------
+RUN set -euxo pipefail; \
+    source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
     "${VENV_PY}" -m pip install --no-cache-dir \
-      torch==2.10.0 torchvision==0.25.0; \
+      torch==2.10.0+cu128 \
+      torchvision==0.25.0+cu128 \
+      torchaudio==2.10.0+cu128 \
+      --index-url https://download.pytorch.org/whl/cu128; \
     "${VENV_PY}" - <<'PY'
-import torch, torchvision
+import torch, torchvision, torchaudio
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
-print("torch cuda (wheel build):", torch.version.cuda)
-# build-time often has no GPU/driver mounted, so don't check torch.cuda.is_available() here
-assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
-print("OK: allow_fp16_accumulation present (build-time)")
+print("torchaudio:", torchaudio.__version__)
+print("cuda (wheel):", torch.version.cuda)
+assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
+print("OK: FP16 accumulation present")
 PY
 
-# --- Custom nodes (your original clones) ---
+# ------------------------------------------------------------
+# Custom nodes
+# ------------------------------------------------------------
 WORKDIR /comfyui/custom_nodes
+
 RUN set -euxo pipefail; \
     git clone https://github.com/chibiace/ComfyUI-Chibi-Nodes; \
     git clone https://github.com/chrisgoringe/cg-use-everywhere; \
@@ -51,7 +71,10 @@ RUN set -euxo pipefail; \
     git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts; \
     git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
 
-# --- Install ALL custom node requirements into the SAME venv ComfyUI uses ---
+# ------------------------------------------------------------
+# Install ALL custom-node requirements into the SAME venv
+# (this will NOT remove torchaudio)
+# ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     for r in /comfyui/custom_nodes/*/requirements*.txt; do \
@@ -69,24 +92,20 @@ RUN set -euxo pipefail; \
       fi; \
     done
 
-# --- Re-assert stable torch/vision AFTER custom node installs (prevents downgrades) ---
-# NOTE: Still do NOT assert torch.cuda.is_available() during docker build.
+# ------------------------------------------------------------
+# Final sanity check: WanVideo nodes MUST import
+# ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
-    "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
-    "${VENV_PY}" -m pip install --no-cache-dir \
-      torch==2.10.0 torchvision==0.25.0; \
     "${VENV_PY}" - <<'PY'
-import torch, torchvision
-print("FINAL torch:", torch.__version__)
-print("FINAL torchvision:", torchvision.__version__)
-print("FINAL cuda (wheel build):", torch.version.cuda)
-# build-time often has no GPU/driver mounted, so don't check torch.cuda.is_available() here
-assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
-print("OK: allow_fp16_accumulation present (final build-time)")
+import importlib
+import torchaudio
+importlib.import_module("custom_nodes.ComfyUI-WanVideoWrapper.nodes")
+print("OK: WanVideoWrapper imports cleanly")
 PY
 
-# --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
+# ------------------------------------------------------------
+# IMPORTANT: Do NOT override RunPod runtime scripts
+# ------------------------------------------------------------
 WORKDIR /comfyui
-
 COPY handler.py /handler.py
