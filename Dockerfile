@@ -25,6 +25,7 @@ RUN set -euxo pipefail; \
     "${VENV_PY}" -V
 
 # --- FP16 fix (stable): replicate manual fix inside the SAME venv ComfyUI uses ---
+# NOTE: Do NOT assert torch.cuda.is_available() during docker build (build usually has no GPU access).
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel; \
@@ -35,10 +36,10 @@ RUN set -euxo pipefail; \
 import torch, torchvision
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
-print("torch cuda:", torch.version.cuda)
-assert torch.cuda.is_available(), "CUDA not available (host driver too old for this wheel?)"
+print("torch cuda (wheel build):", torch.version.cuda)
+# build-time often has no GPU/driver mounted, so don't check torch.cuda.is_available() here
 assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
-print("OK: allow_fp16_accumulation present")
+print("OK: allow_fp16_accumulation present (build-time)")
 PY
 
 # --- Custom nodes (your original clones) ---
@@ -69,6 +70,7 @@ RUN set -euxo pipefail; \
     done
 
 # --- Re-assert stable torch/vision AFTER custom node installs (prevents downgrades) ---
+# NOTE: Still do NOT assert torch.cuda.is_available() during docker build.
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
@@ -78,14 +80,13 @@ RUN set -euxo pipefail; \
 import torch, torchvision
 print("FINAL torch:", torch.__version__)
 print("FINAL torchvision:", torchvision.__version__)
-print("FINAL cuda:", torch.version.cuda)
-assert torch.cuda.is_available()
-assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
-print("OK: allow_fp16_accumulation present (final)")
+print("FINAL cuda (wheel build):", torch.version.cuda)
+# build-time often has no GPU/driver mounted, so don't check torch.cuda.is_available() here
+assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
+print("OK: allow_fp16_accumulation present (final build-time)")
 PY
 
 # --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
 WORKDIR /comfyui
 
 COPY handler.py /handler.py
-
