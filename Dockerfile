@@ -1,67 +1,75 @@
-FROM runpod/worker-comfyui:5.7.1-base
-SHELL ["/bin/bash", "-lc"]
+# ---- Base: CUDA 12.4 runtime (good for cu124 nightlies) ----
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# Tools (git for clones, ffmpeg for ffprobe mp4 validation)
-RUN apt-get update && apt-get install -y git ffmpeg && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Use the same Python env ComfyUI runs with (prefer /opt/venv; fall back if needed)
-ENV VENV_CANDIDATES="/opt/venv /workspace/venv /comfyui/.venv"
-RUN for v in ${VENV_CANDIDATES}; do \
-      if [ -x "${v}/bin/python" ]; then echo "export VENV_PY=${v}/bin/python" > /etc/profile.d/venv.sh; break; fi; \
-    done \
- && source /etc/profile.d/venv.sh \
- && test -n "${VENV_PY:-}" || (echo "No venv python found" && exit 1)
+# ---- System deps ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget git \
+    python3 python3-venv python3-pip \
+    build-essential pkg-config \
+    libgl1 libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Prove which python we will use (must match ComfyUI runtime env)
-RUN source /etc/profile.d/venv.sh \
- && "${VENV_PY}" -c "import sys; print('python:', sys.executable)"
+# ---- Virtualenv ----
+ENV VENV_DIR=/opt/venv
+RUN python3 -m venv ${VENV_DIR}
+ENV PATH="${VENV_DIR}/bin:${PATH}"
+ENV VENV_PY="${VENV_DIR}/bin/python"
 
-# --- Install endpoint custom nodes ---
-WORKDIR /comfyui/custom_nodes
-RUN git clone https://github.com/chibiace/ComfyUI-Chibi-Nodes \
- && git clone https://github.com/chrisgoringe/cg-use-everywhere \
- && git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite \
- && git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts \
- && git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+# Upgrade pip tooling
+RUN "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel
 
-# --- Install ALL custom node requirements into the SAME venv ComfyUI uses (STRICT) ---
-RUN source /etc/profile.d/venv.sh \
- && for r in /comfyui/custom_nodes/*/requirements*.txt; do \
-      if [ -f "$r" ]; then \
-        echo "Installing $r"; \
-        "${VENV_PY}" -m pip install --no-cache-dir -r "$r"; \
-      fi; \
-    done \
- && for d in /comfyui/custom_nodes/*/requirements; do \
-      if [ -d "$d" ]; then \
-        while IFS= read -r -d '' f; do \
-          echo "Installing $f"; \
-          "${VENV_PY}" -m pip install --no-cache-dir -r "$f"; \
-        done < <(find "$d" -maxdepth 1 -type f -name '*.txt' -print0); \
-      fi; \
-    done
-
-# --- FP16 + WanVideoWrapper fix: FORCE torch/torchvision/torchaudio 2.7 nightly cu124 ---
+# ---- PINNED PyTorch nightlies (Option A) ----
+# Pick ONE nightly date and pin torch/vision/audio to the *same* date.
+# This avoids the exact conflict you saw (vision dev build hard-pins torch==same-date).
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu124
-RUN source /etc/profile.d/venv.sh \
- && "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true \
- && "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre \
-      torch torchvision torchaudio \
-      --index-url ${PYTORCH_INDEX_URL}
+ARG TORCH_VER=2.7.0.dev20250226+cu124
+ARG TORCHVISION_VER=0.22.0.dev20250226+cu124
+ARG TORCHAUDIO_VER=2.7.0.dev20250226+cu124
 
-# Verify: must be cu124 + allow_fp16_accumulation exists + torchaudio imports
-RUN source /etc/profile.d/venv.sh && "${VENV_PY}" - <<'EOF'
-import torch, torchvision, torchaudio
+RUN "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true \
+ && "${VENV_PY}" -m pip install --no-cache-dir --force-reinstall --pre \
+      "torch==${TORCH_VER}" \
+      "torchvision==${TORCHVISION_VER}" \
+      "torchaudio==${TORCHAUDIO_VER}" \
+      --index-url "${PYTORCH_INDEX_URL}" \
+ && "${VENV_PY}" - <<'PY'
+import torch, torchvision
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
-print("torchaudio:", torchaudio.__version__)
-print("cuda:", torch.version.cuda)
-assert torch.version.cuda == "12.4"
-assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
-print("OK")
-EOF
+print("has allow_fp16_accumulation:",
+      hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"))
+PY
 
-# IMPORTANT:
-# - No COPY of start.sh/handler.py
-# - No CMD override
-# Base image will run the default RunPod ComfyUI worker.
+# ---- ComfyUI ----
+WORKDIR /workspace/runpod-slim
+
+# Clone ComfyUI (pin to a commit if you want fully reproducible builds)
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git
+
+# Install ComfyUI python deps
+RUN "${VENV_PY}" -m pip install --no-cache-dir -r /workspace/runpod-slim/ComfyUI/requirements.txt
+
+# (Optional) comfy-cli if you use `comfy` commands (model download, etc.)
+RUN "${VENV_PY}" -m pip install --no-cache-dir -U comfy-cli
+
+# ---- Custom nodes (optional: add your own clones here) ----
+# Example (keep commented; add the nodes you actually want)
+# RUN git clone https://github.com/<you>/<node>.git /workspace/runpod-slim/ComfyUI/custom_nodes/<node>
+
+# Install any custom node requirements if you have them.
+# IMPORTANT: do this AFTER torch is pinned, so node deps don’t drag torch around.
+# RUN find /workspace/runpod-slim/ComfyUI/custom_nodes -maxdepth 2 -name "requirements.txt" -print -exec "${VENV_PY}" -m pip install --no-cache-dir -r {} \;
+
+# ---- Start script ----
+# If you already have a start.sh in your repo, COPY it in.
+# Otherwise, here’s a simple default that starts ComfyUI.
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 8188
+CMD ["/bin/bash", "-lc", "/start.sh"]
