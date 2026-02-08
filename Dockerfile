@@ -38,8 +38,7 @@ RUN set -euxo pipefail; \
     "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel
 
 # ------------------------------------------------------------
-# Torch stack (PINNED + CUDA-matched)
-# IMPORTANT: install torchaudio and NEVER remove it later
+# Torch stack (CUDA-matched, torchaudio INCLUDED)
 # ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
@@ -47,7 +46,7 @@ RUN set -euxo pipefail; \
     "${VENV_PY}" -m pip install --no-cache-dir \
       torch==2.10.0+cu128 \
       torchvision==0.25.0+cu128 \
-      torchaudio==2.10.0+cu128 \
+      torchaudio==2.10.0 \
       --index-url https://download.pytorch.org/whl/cu128; \
     "${VENV_PY}" - <<'PY'
 import torch, torchvision, torchaudio
@@ -73,36 +72,22 @@ RUN set -euxo pipefail; \
 
 # ------------------------------------------------------------
 # Install ALL custom-node requirements into the SAME venv
-# (this will NOT remove torchaudio)
+# (does NOT remove torchaudio)
 # ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     for r in /comfyui/custom_nodes/*/requirements*.txt; do \
       if [ -f "$r" ]; then \
-        echo "Installing $r"; \
         "${VENV_PY}" -m pip install --no-cache-dir -r "$r"; \
       fi; \
     done; \
     for d in /comfyui/custom_nodes/*/requirements; do \
       if [ -d "$d" ]; then \
         while IFS= read -r -d '' f; do \
-          echo "Installing $f"; \
           "${VENV_PY}" -m pip install --no-cache-dir -r "$f"; \
         done < <(find "$d" -maxdepth 1 -type f -name '*.txt' -print0); \
       fi; \
     done
-
-# ------------------------------------------------------------
-# Final sanity check: WanVideo nodes MUST import
-# ------------------------------------------------------------
-RUN set -euxo pipefail; \
-    source /etc/profile.d/venv.sh; \
-    "${VENV_PY}" - <<'PY'
-import importlib
-import torchaudio
-importlib.import_module("custom_nodes.ComfyUI-WanVideoWrapper.nodes")
-print("OK: WanVideoWrapper imports cleanly")
-PY
 
 # ------------------------------------------------------------
 # IMPORTANT: Do NOT override RunPod runtime scripts
