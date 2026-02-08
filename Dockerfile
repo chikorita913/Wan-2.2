@@ -24,30 +24,19 @@ RUN set -euxo pipefail; \
     test -n "${VENV_PY:-}" || (echo "No venv python found in: ${VENV_CANDIDATES}" && exit 1); \
     "${VENV_PY}" -V
 
-# --- FP16 fix: install latest PyTorch nightly cu124 (resolver-safe vs wheel rotation) ---
-ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu124
+# --- FP16 fix (stable): replicate manual fix inside the SAME venv ComfyUI uses ---
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel; \
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
-    \
-    # 1) Install torch first (pick whatever nightly is currently available)
-    "${VENV_PY}" -m pip install --no-cache-dir --pre \
-      --index-url "${PYTORCH_INDEX_URL}" \
-      --extra-index-url https://pypi.org/simple \
-      torch; \
-    \
-    # 2) Install torchvision + torchaudio but DO NOT let them re-resolve torch
-    "${VENV_PY}" -m pip install --no-cache-dir --pre --no-deps \
-      --index-url "${PYTORCH_INDEX_URL}" \
-      torchvision torchaudio; \
-    \
+    "${VENV_PY}" -m pip install --no-cache-dir \
+      torch==2.10.0 torchvision==0.25.0; \
     "${VENV_PY}" - <<'PY'
-import torch, torchvision, torchaudio
+import torch, torchvision
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
-print("torchaudio:", torchaudio.__version__)
-print("cuda:", torch.version.cuda)
+print("torch cuda:", torch.version.cuda)
+assert torch.cuda.is_available(), "CUDA not available (host driver too old for this wheel?)"
 assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
 print("OK: allow_fp16_accumulation present")
 PY
@@ -61,7 +50,7 @@ RUN set -euxo pipefail; \
     git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts; \
     git clone https://github.com/kijai/ComfyUI-WanVideoWrapper
 
-# --- Install ALL custom node requirements into the SAME venv ComfyUI uses (STRICT) ---
+# --- Install ALL custom node requirements into the SAME venv ComfyUI uses ---
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     for r in /comfyui/custom_nodes/*/requirements*.txt; do \
@@ -79,30 +68,21 @@ RUN set -euxo pipefail; \
       fi; \
     done
 
-# --- Re-assert nightly torch stack AFTER custom node installs (prevents downgrades/pins from requirements) ---
+# --- Re-assert stable torch/vision AFTER custom node installs (prevents downgrades) ---
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
-    \
-    # If any node requirements changed torch/vision/audio, force back to cu124 nightly
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
-    "${VENV_PY}" -m pip install --no-cache-dir --pre \
-      --index-url "${PYTORCH_INDEX_URL}" \
-      --extra-index-url https://pypi.org/simple \
-      torch; \
-    "${VENV_PY}" -m pip install --no-cache-dir --pre --no-deps \
-      --index-url "${PYTORCH_INDEX_URL}" \
-      torchvision torchaudio; \
-    \
+    "${VENV_PY}" -m pip install --no-cache-dir \
+      torch==2.10.0 torchvision==0.25.0; \
     "${VENV_PY}" - <<'PY'
-import torch, torchvision, torchaudio
+import torch, torchvision
 print("FINAL torch:", torch.__version__)
 print("FINAL torchvision:", torchvision.__version__)
-print("FINAL torchaudio:", torchaudio.__version__)
 print("FINAL cuda:", torch.version.cuda)
-assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
+assert torch.cuda.is_available()
+assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
 print("OK: allow_fp16_accumulation present (final)")
 PY
 
 # --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
-# (No COPY start.sh, no COPY handler.py, no CMD/ENTRYPOINT here.)
 WORKDIR /comfyui
