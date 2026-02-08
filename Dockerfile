@@ -24,19 +24,26 @@ RUN set -euxo pipefail; \
     test -n "${VENV_PY:-}" || (echo "No venv python found in: ${VENV_CANDIDATES}" && exit 1); \
     "${VENV_PY}" -V
 
-# --- FP16 fix: install latest PyTorch nightly cu124 (NO date pin, avoids wheel rotation breakage) ---
+# --- FP16 fix: install latest PyTorch nightly cu124 (resolver-safe vs wheel rotation) ---
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu124
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
     "${VENV_PY}" -m pip install --no-cache-dir -U pip setuptools wheel; \
     "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
+    \
+    # 1) Install torch first (pick whatever nightly is currently available)
     "${VENV_PY}" -m pip install --no-cache-dir --pre \
       --index-url "${PYTORCH_INDEX_URL}" \
-      torch torchvision torchaudio; \
+      --extra-index-url https://pypi.org/simple \
+      torch; \
+    \
+    # 2) Install torchvision + torchaudio but DO NOT let them re-resolve torch
+    "${VENV_PY}" -m pip install --no-cache-dir --pre --no-deps \
+      --index-url "${PYTORCH_INDEX_URL}" \
+      torchvision torchaudio; \
+    \
     "${VENV_PY}" - <<'PY'
-import torch
-import torchvision
-import torchaudio
+import torch, torchvision, torchaudio
 print("torch:", torch.__version__)
 print("torchvision:", torchvision.__version__)
 print("torchaudio:", torchaudio.__version__)
@@ -71,6 +78,30 @@ RUN set -euxo pipefail; \
         done < <(find "$d" -maxdepth 1 -type f -name '*.txt' -print0); \
       fi; \
     done
+
+# --- Re-assert nightly torch stack AFTER custom node installs (prevents downgrades/pins from requirements) ---
+RUN set -euxo pipefail; \
+    source /etc/profile.d/venv.sh; \
+    \
+    # If any node requirements changed torch/vision/audio, force back to cu124 nightly
+    "${VENV_PY}" -m pip uninstall -y torch torchvision torchaudio || true; \
+    "${VENV_PY}" -m pip install --no-cache-dir --pre \
+      --index-url "${PYTORCH_INDEX_URL}" \
+      --extra-index-url https://pypi.org/simple \
+      torch; \
+    "${VENV_PY}" -m pip install --no-cache-dir --pre --no-deps \
+      --index-url "${PYTORCH_INDEX_URL}" \
+      torchvision torchaudio; \
+    \
+    "${VENV_PY}" - <<'PY'
+import torch, torchvision, torchaudio
+print("FINAL torch:", torch.__version__)
+print("FINAL torchvision:", torchvision.__version__)
+print("FINAL torchaudio:", torchaudio.__version__)
+print("FINAL cuda:", torch.version.cuda)
+assert hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"), "missing allow_fp16_accumulation"
+print("OK: allow_fp16_accumulation present (final)")
+PY
 
 # --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
 # (No COPY start.sh, no COPY handler.py, no CMD/ENTRYPOINT here.)
