@@ -86,3 +86,6 @@ PY
 
 # --- IMPORTANT: Do NOT override RunPod base runtime scripts ---
 WORKDIR /comfyui
+
+COPY handler.py /handler.py
+
