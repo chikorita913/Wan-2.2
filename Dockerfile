@@ -113,3 +113,5 @@ RUN set -euxo pipefail; \
 # ------------------------------------------------------------
 WORKDIR /comfyui
 COPY handler.py /handler.py
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
