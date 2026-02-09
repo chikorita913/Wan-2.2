@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 ############################
 # Link persistent models
@@ -34,7 +34,7 @@ ls -lah "$DST" | head -n 50
 echo "[models] done ✅"
 
 ############################
-# Original start script
+# Original RunPod start logic
 ############################
 
 # Use libtcmalloc for better memory management
@@ -42,14 +42,14 @@ TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
 export LD_PRELOAD="${TCMALLOC}"
 
 # Ensure ComfyUI-Manager runs in offline network mode inside the container
-comfy-manager-set-mode offline || echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
+comfy-manager-set-mode offline || \
+  echo "worker-comfyui - Could not set ComfyUI-Manager network_mode" >&2
 
 echo "worker-comfyui: Starting ComfyUI"
 
 # Allow operators to tweak verbosity; default is DEBUG.
 : "${COMFY_LOG_LEVEL:=DEBUG}"
 
-# Serve the API and don't shutdown the container
 if [ "$SERVE_API_LOCALLY" == "true" ]; then
     python -u /comfyui/main.py \
       --disable-auto-launch \
