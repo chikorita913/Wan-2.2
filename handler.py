@@ -456,11 +456,16 @@ def queue_workflow(workflow, client_id, comfy_org_api_key=None):
 def _snapshot_output_dir():
     """Return a set of file paths currently in the ComfyUI output directory."""
     if not os.path.isdir(COMFY_OUTPUT_DIR):
+        print(f"worker-comfyui - [snapshot] Output directory does not exist: {COMFY_OUTPUT_DIR}")
         return set()
-    return {
+    files = {
         os.path.join(COMFY_OUTPUT_DIR, f)
         for f in os.listdir(COMFY_OUTPUT_DIR)
     }
+    print(f"worker-comfyui - [snapshot] {len(files)} file(s) in {COMFY_OUTPUT_DIR}")
+    for f in sorted(files):
+        print(f"worker-comfyui - [snapshot]   existing: {os.path.basename(f)}")
+    return files
 
 
 def _find_new_videos(pre_snapshot):
@@ -474,16 +479,29 @@ def _find_new_videos(pre_snapshot):
         list: Sorted list of new video file paths.
     """
     if not os.path.isdir(COMFY_OUTPUT_DIR):
+        print(f"worker-comfyui - [scan] Output directory does not exist: {COMFY_OUTPUT_DIR}")
         return []
+
     current = {
         os.path.join(COMFY_OUTPUT_DIR, f)
         for f in os.listdir(COMFY_OUTPUT_DIR)
     }
+    print(f"worker-comfyui - [scan] {len(current)} total file(s) now in {COMFY_OUTPUT_DIR}")
+
     new_files = current - pre_snapshot
+    print(f"worker-comfyui - [scan] {len(new_files)} new file(s) since snapshot")
+    for f in sorted(new_files):
+        ext = os.path.splitext(f)[1].lower()
+        size_bytes = os.path.getsize(f) if os.path.isfile(f) else -1
+        size_mb = size_bytes / (1024 * 1024) if size_bytes > 0 else 0
+        is_video = ext in VIDEO_EXTENSIONS
+        print(f"worker-comfyui - [scan]   new: {os.path.basename(f)} | ext={ext} | size={size_mb:.2f}MB | is_video={is_video}")
+
     videos = [
         f for f in sorted(new_files)
         if os.path.isfile(f) and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
     ]
+    print(f"worker-comfyui - [scan] {len(videos)} file(s) matched video extensions {VIDEO_EXTENSIONS}")
     return videos
 
 
@@ -652,21 +670,40 @@ def handler(job):
         # Scan output directory for new video files
         # -----------------------------------------------------------------
         print(f"worker-comfyui - Scanning for new video files in {COMFY_OUTPUT_DIR}...")
+        print(f"worker-comfyui - Output dir exists: {os.path.isdir(COMFY_OUTPUT_DIR)}")
         new_videos = _find_new_videos(pre_execution_snapshot)
 
-        if not new_videos and not errors:
-            errors.append("Workflow completed but produced no video files.")
+        if not new_videos:
+            print(f"worker-comfyui - WARNING: No new video files detected after workflow execution")
+            # Log full directory contents for debugging
+            if os.path.isdir(COMFY_OUTPUT_DIR):
+                all_files = os.listdir(COMFY_OUTPUT_DIR)
+                print(f"worker-comfyui - [debug] Full directory listing of {COMFY_OUTPUT_DIR} ({len(all_files)} files):")
+                for f in sorted(all_files):
+                    fpath = os.path.join(COMFY_OUTPUT_DIR, f)
+                    ext = os.path.splitext(f)[1].lower()
+                    size_bytes = os.path.getsize(fpath) if os.path.isfile(fpath) else -1
+                    print(f"worker-comfyui - [debug]   {f} | ext={ext} | size={size_bytes}B | is_dir={os.path.isdir(fpath)}")
+            else:
+                print(f"worker-comfyui - [debug] Output directory {COMFY_OUTPUT_DIR} does not exist!")
+            if not errors:
+                errors.append("Workflow completed but produced no video files.")
 
         print(f"worker-comfyui - Found {len(new_videos)} new video file(s)")
 
+        bucket_url = os.environ.get("BUCKET_ENDPOINT_URL")
+        print(f"worker-comfyui - S3 BUCKET_ENDPOINT_URL configured: {bool(bucket_url)}")
+
         for video_path in new_videos:
             filename = os.path.basename(video_path)
+            file_size = os.path.getsize(video_path) if os.path.isfile(video_path) else -1
+            print(f"worker-comfyui - Processing video: {filename} ({file_size / (1024*1024):.2f}MB) at {video_path}")
 
-            if os.environ.get("BUCKET_ENDPOINT_URL"):
+            if bucket_url:
                 try:
-                    print(f"worker-comfyui - Uploading {filename} to S3...")
+                    print(f"worker-comfyui - Uploading {filename} to S3 (job_id={job_id})...")
                     s3_url = rp_upload.upload_image(job_id, video_path)
-                    print(f"worker-comfyui - Uploaded {filename} to S3: {s3_url}")
+                    print(f"worker-comfyui - Upload complete: {filename} -> {s3_url}")
                     output_data.append({
                         "filename": filename,
                         "type": "s3_url",
@@ -675,9 +712,10 @@ def handler(job):
                 except Exception as e:
                     error_msg = f"Error uploading {filename} to S3: {e}"
                     print(f"worker-comfyui - {error_msg}")
+                    print(f"worker-comfyui - Upload traceback: {traceback.format_exc()}")
                     errors.append(error_msg)
             else:
-                print(f"worker-comfyui - No S3 config, returning local path for {filename}")
+                print(f"worker-comfyui - No S3 config (BUCKET_ENDPOINT_URL not set), returning local path for {filename}")
                 output_data.append({
                     "filename": filename,
                     "type": "local_path",
