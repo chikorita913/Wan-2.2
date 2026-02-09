@@ -73,16 +73,26 @@ RUN set -euxo pipefail; \
 
 # ------------------------------------------------------------
 # Install ALL custom-node requirements into the SAME venv
-# (explicitly includes VFI deps; torchaudio is preserved)
+# BUT: for ComfyUI-Frame-Interpolation, force NO-CUPY requirements
 # ------------------------------------------------------------
 RUN set -euxo pipefail; \
     source /etc/profile.d/venv.sh; \
+    \
+    # 1) Install requirements*.txt for all nodes, except the VFI node's cupy/alt files
     for r in /comfyui/custom_nodes/*/requirements*.txt; do \
       if [ -f "$r" ]; then \
-        echo "Installing $r"; \
-        "${VENV_PY}" -m pip install --no-cache-dir -r "$r"; \
+        case "$r" in \
+          /comfyui/custom_nodes/ComfyUI-Frame-Interpolation/requirements-with-cupy.txt|\
+          /comfyui/custom_nodes/ComfyUI-Frame-Interpolation/requirements.txt) \
+            echo "Skipping VFI requirements file (will install no-cupy instead): $r" ;; \
+          *) \
+            echo "Installing $r"; \
+            "${VENV_PY}" -m pip install --no-cache-dir -r "$r" ;; \
+        esac; \
       fi; \
     done; \
+    \
+    # 2) Install requirements/*.txt folders (unchanged behavior)
     for d in /comfyui/custom_nodes/*/requirements; do \
       if [ -d "$d" ]; then \
         while IFS= read -r -d '' f; do \
@@ -90,7 +100,13 @@ RUN set -euxo pipefail; \
           "${VENV_PY}" -m pip install --no-cache-dir -r "$f"; \
         done < <(find "$d" -maxdepth 1 -type f -name '*.txt' -print0); \
       fi; \
-    done
+    done; \
+    \
+    # 3) Force install NO-CUPY deps for ComfyUI-Frame-Interpolation
+    VFI_NO_CUPY="/comfyui/custom_nodes/ComfyUI-Frame-Interpolation/requirements-no-cupy.txt"; \
+    test -f "$VFI_NO_CUPY" || (echo "Missing $VFI_NO_CUPY" && exit 1); \
+    echo "Installing VFI NO-CUPY deps: $VFI_NO_CUPY"; \
+    "${VENV_PY}" -m pip install --no-cache-dir -r "$VFI_NO_CUPY"
 
 # ------------------------------------------------------------
 # IMPORTANT: Do NOT override RunPod runtime scripts
