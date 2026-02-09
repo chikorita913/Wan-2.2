@@ -1,8 +1,6 @@
 import runpod
 from runpod.serverless.utils import rp_upload
 import json
-import urllib.request
-import urllib.parse
 import time
 import os
 import requests
@@ -10,7 +8,6 @@ import base64
 from io import BytesIO
 import websocket
 import uuid
-import tempfile
 import socket
 import traceback
 import logging
@@ -47,6 +44,10 @@ if os.environ.get("WEBSOCKET_TRACE", "false").lower() == "true":
 
 # Host where ComfyUI is running
 COMFY_HOST = "127.0.0.1:8188"
+# Output directory where ComfyUI writes generated files
+COMFY_OUTPUT_DIR = "/comfyui/output"
+# Video file extensions to detect
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".gif"}
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
@@ -452,67 +453,52 @@ def queue_workflow(workflow, client_id, comfy_org_api_key=None):
     return response.json()
 
 
-def get_history(prompt_id):
+def _snapshot_output_dir():
+    """Return a set of file paths currently in the ComfyUI output directory."""
+    if not os.path.isdir(COMFY_OUTPUT_DIR):
+        return set()
+    return {
+        os.path.join(COMFY_OUTPUT_DIR, f)
+        for f in os.listdir(COMFY_OUTPUT_DIR)
+    }
+
+
+def _find_new_videos(pre_snapshot):
     """
-    Retrieve the history of a given prompt using its ID
+    Return a sorted list of new video file paths created since the pre-execution snapshot.
 
     Args:
-        prompt_id (str): The ID of the prompt whose history is to be retrieved
+        pre_snapshot (set): Set of file paths that existed before workflow execution.
 
     Returns:
-        dict: The history of the prompt, containing all the processing steps and results
+        list: Sorted list of new video file paths.
     """
-    # Use requests for consistency and timeout
-    response = requests.get(f"http://{COMFY_HOST}/history/{prompt_id}", timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def get_image_data(filename, subfolder, image_type):
-    """
-    Fetch image bytes from the ComfyUI /view endpoint.
-
-    Args:
-        filename (str): The filename of the image.
-        subfolder (str): The subfolder where the image is stored.
-        image_type (str): The type of the image (e.g., 'output').
-
-    Returns:
-        bytes: The raw image data, or None if an error occurs.
-    """
-    print(
-        f"worker-comfyui - Fetching image data: type={image_type}, subfolder={subfolder}, filename={filename}"
-    )
-    data = {"filename": filename, "subfolder": subfolder, "type": image_type}
-    url_values = urllib.parse.urlencode(data)
-    try:
-        # Use requests for consistency and timeout
-        response = requests.get(f"http://{COMFY_HOST}/view?{url_values}", timeout=60)
-        response.raise_for_status()
-        print(f"worker-comfyui - Successfully fetched image data for {filename}")
-        return response.content
-    except requests.Timeout:
-        print(f"worker-comfyui - Timeout fetching image data for {filename}")
-        return None
-    except requests.RequestException as e:
-        print(f"worker-comfyui - Error fetching image data for {filename}: {e}")
-        return None
-    except Exception as e:
-        print(
-            f"worker-comfyui - Unexpected error fetching image data for {filename}: {e}"
-        )
-        return None
+    if not os.path.isdir(COMFY_OUTPUT_DIR):
+        return []
+    current = {
+        os.path.join(COMFY_OUTPUT_DIR, f)
+        for f in os.listdir(COMFY_OUTPUT_DIR)
+    }
+    new_files = current - pre_snapshot
+    videos = [
+        f for f in sorted(new_files)
+        if os.path.isfile(f) and os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
+    ]
+    return videos
 
 
 def handler(job):
     """
-    Handles a job using ComfyUI via websockets for status and image retrieval.
+    Handles a video generation job using ComfyUI.
+
+    Queues a workflow, waits for execution via websocket, then scans the output
+    directory for new video files and uploads them to S3.
 
     Args:
         job (dict): A dictionary containing job details and input parameters.
 
     Returns:
-        dict: A dictionary containing either an error message or a success status with generated images.
+        dict: A dictionary containing either an error message or generated video URLs.
     """
     # ---------------------------------------------------------------------------
     # Network Volume Diagnostics (opt-in via NETWORK_VOLUME_DEBUG=true)
@@ -557,6 +543,10 @@ def handler(job):
     prompt_id = None
     output_data = []
     errors = []
+
+    # Snapshot the output directory before execution so we can diff after
+    pre_execution_snapshot = _snapshot_output_dir()
+    print(f"worker-comfyui - Output dir snapshot: {len(pre_execution_snapshot)} existing file(s)")
 
     try:
         # Establish WebSocket connection
@@ -658,134 +648,41 @@ def handler(job):
                 "Workflow monitoring loop exited without confirmation of completion or error."
             )
 
-        # Fetch history even if there were execution errors, some outputs might exist
-        print(f"worker-comfyui - Fetching history for prompt {prompt_id}...")
-        history = get_history(prompt_id)
+        # -----------------------------------------------------------------
+        # Scan output directory for new video files
+        # -----------------------------------------------------------------
+        print(f"worker-comfyui - Scanning for new video files in {COMFY_OUTPUT_DIR}...")
+        new_videos = _find_new_videos(pre_execution_snapshot)
 
-        if prompt_id not in history:
-            error_msg = f"Prompt ID {prompt_id} not found in history after execution."
-            print(f"worker-comfyui - {error_msg}")
-            if not errors:
-                return {"error": error_msg}
-            else:
-                errors.append(error_msg)
-                return {
-                    "error": "Job processing failed, prompt ID not found in history.",
-                    "details": errors,
-                }
+        if not new_videos and not errors:
+            errors.append("Workflow completed but produced no video files.")
 
-        prompt_history = history.get(prompt_id, {})
-        outputs = prompt_history.get("outputs", {})
+        print(f"worker-comfyui - Found {len(new_videos)} new video file(s)")
 
-        if not outputs:
-            warning_msg = f"No outputs found in history for prompt {prompt_id}."
-            print(f"worker-comfyui - {warning_msg}")
-            if not errors:
-                errors.append(warning_msg)
-
-                # -------------------------------------------------------------------
-        # VIDEO-ONLY OUTPUT HANDLING (scan output dir and upload *.mp4/etc)
-        # -------------------------------------------------------------------
-
-        # We’ll use the time we started fetching history as a rough “job finished” marker.
-        # Better: capture a timestamp at the very start of handler(), but this works well enough
-        # if you only care about “latest outputs”.
-        now_ts = time.time()
-
-        # Candidate output roots (covers your observed path + the standalone /comfyui install)
-        output_dir_candidates = [
-            "/workspace/runpod-slim/ComfyUI/output",
-            "/comfyui/output",
-            "/workspace/ComfyUI/output",
-        ]
-
-        output_root = None
-        for d in output_dir_candidates:
-            if os.path.isdir(d):
-                output_root = d
-                break
-
-        if not output_root:
-            raise ValueError(
-                f"Could not find ComfyUI output directory. Tried: {output_dir_candidates}"
-            )
-
-        print(f"worker-comfyui - Using ComfyUI output directory: {output_root}")
-
-        video_exts = {".mp4", ".webm", ".mov", ".mkv", ".gif"}
-
-        # Collect videos; prefer “recent” files so we don’t re-upload old runs.
-        # We’ll take files modified in the last 30 minutes as a safe window.
-        # (You can tighten this once stable, e.g. 5 minutes.)
-        recent_window_s = int(os.environ.get("OUTPUT_RECENT_WINDOW_S", "1800"))
-        cutoff = now_ts - recent_window_s
-
-        video_paths = []
-        try:
-            for name in os.listdir(output_root):
-                path = os.path.join(output_root, name)
-                if not os.path.isfile(path):
-                    continue
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in video_exts:
-                    continue
-                try:
-                    st = os.stat(path)
-                    if st.st_mtime >= cutoff:
-                        video_paths.append(path)
-                except OSError:
-                    continue
-        except Exception as e:
-            raise ValueError(f"Failed scanning output directory {output_root}: {e}")
-
-        video_paths.sort(key=lambda p: os.stat(p).st_mtime)
-
-        if not video_paths:
-            warn_msg = (
-                f"No recent video files found in {output_root}. "
-                f"(cutoff window: last {recent_window_s}s)"
-            )
-            print(f"worker-comfyui - WARNING: {warn_msg}")
-            errors.append(warn_msg)
-
-        # Upload videos if S3 env is configured
-        for vp in video_paths:
-            filename = os.path.basename(vp)
-            print(f"worker-comfyui - Found video: {vp}")
+        for video_path in new_videos:
+            filename = os.path.basename(video_path)
 
             if os.environ.get("BUCKET_ENDPOINT_URL"):
                 try:
-                    print(f"worker-comfyui - Uploading video to S3: {filename}")
-                    s3_url = rp_upload.upload_image(job_id, vp)
+                    print(f"worker-comfyui - Uploading {filename} to S3...")
+                    s3_url = rp_upload.upload_image(job_id, video_path)
                     print(f"worker-comfyui - Uploaded {filename} to S3: {s3_url}")
-                    output_data.append(
-                        {"filename": filename, "type": "s3_url", "data": s3_url}
-                    )
+                    output_data.append({
+                        "filename": filename,
+                        "type": "s3_url",
+                        "data": s3_url,
+                    })
                 except Exception as e:
                     error_msg = f"Error uploading {filename} to S3: {e}"
                     print(f"worker-comfyui - {error_msg}")
                     errors.append(error_msg)
             else:
-                # No BUCKET configured: do NOT base64 huge videos by default.
-                # Return local path as a hint (mostly useful in SERVE_API_LOCALLY dev mode).
-                output_data.append(
-                    {"filename": filename, "type": "local_path", "data": vp}
-                )
-
-        # OPTIONAL: If you want to *never* return images, we’re done here.
-        # We ignore outputs[] parsing entirely.
-
-
-            # Check for other output types
-            other_keys = [k for k in node_output.keys() if k != "images"]
-            if other_keys:
-                warn_msg = (
-                    f"Node {node_id} produced unhandled output keys: {other_keys}."
-                )
-                print(f"worker-comfyui - WARNING: {warn_msg}")
-                print(
-                    f"worker-comfyui - --> If this output is useful, please consider opening an issue on GitHub to discuss adding support."
-                )
+                print(f"worker-comfyui - No S3 config, returning local path for {filename}")
+                output_data.append({
+                    "filename": filename,
+                    "type": "local_path",
+                    "data": video_path,
+                })
 
     except websocket.WebSocketException as e:
         print(f"worker-comfyui - WebSocket Error: {e}")
@@ -818,19 +715,17 @@ def handler(job):
         print(f"worker-comfyui - Job completed with errors/warnings: {errors}")
 
     if not output_data and errors:
-        print(f"worker-comfyui - Job failed with no output images.")
+        print(f"worker-comfyui - Job failed with no output videos.")
         return {
             "error": "Job processing failed",
             "details": errors,
         }
     elif not output_data and not errors:
-        print(
-            f"worker-comfyui - Job completed successfully, but the workflow produced no images."
-        )
-        final_result["status"] = "success_no_images"
-        final_result["images"] = []
+        print(f"worker-comfyui - Job completed but produced no video files.")
+        final_result["status"] = "success_no_videos"
+        final_result["videos"] = []
 
-    print(f"worker-comfyui - Job completed. Returning {len(output_data)} videos(s).")
+    print(f"worker-comfyui - Job completed. Returning {len(output_data)} video(s).")
     return final_result
 
 
