@@ -1,5 +1,5 @@
 import runpod
-from runpod.serverless.utils import rp_upload
+import boto3
 import json
 import time
 import os
@@ -48,6 +48,11 @@ COMFY_HOST = "127.0.0.1:8188"
 COMFY_OUTPUT_DIR = "/comfyui/output"
 # Video file extensions to detect
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".gif"}
+# S3 bucket for video uploads
+S3_BUCKET = "overpass-media"
+# S3 client (initialized once at module level; uses AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, and AWS_DEFAULT_REGION from environment)
+s3_client = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-west-2"))
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
@@ -691,36 +696,27 @@ def handler(job):
 
         print(f"worker-comfyui - Found {len(new_videos)} new video file(s)")
 
-        bucket_url = os.environ.get("BUCKET_ENDPOINT_URL")
-        print(f"worker-comfyui - S3 BUCKET_ENDPOINT_URL configured: {bool(bucket_url)}")
-
         for video_path in new_videos:
             filename = os.path.basename(video_path)
             file_size = os.path.getsize(video_path) if os.path.isfile(video_path) else -1
+            s3_key = f"videos/{job_id}/{filename}"
             print(f"worker-comfyui - Processing video: {filename} ({file_size / (1024*1024):.2f}MB) at {video_path}")
+            print(f"worker-comfyui - Target S3: s3://{S3_BUCKET}/{s3_key}")
 
-            if bucket_url:
-                try:
-                    print(f"worker-comfyui - Uploading {filename} to S3 (job_id={job_id})...")
-                    s3_url = rp_upload.upload_image(job_id, video_path)
-                    print(f"worker-comfyui - Upload complete: {filename} -> {s3_url}")
-                    output_data.append({
-                        "filename": filename,
-                        "type": "s3_url",
-                        "data": s3_url,
-                    })
-                except Exception as e:
-                    error_msg = f"Error uploading {filename} to S3: {e}"
-                    print(f"worker-comfyui - {error_msg}")
-                    print(f"worker-comfyui - Upload traceback: {traceback.format_exc()}")
-                    errors.append(error_msg)
-            else:
-                print(f"worker-comfyui - No S3 config (BUCKET_ENDPOINT_URL not set), returning local path for {filename}")
+            try:
+                print(f"worker-comfyui - Uploading {filename} to S3 (job_id={job_id})...")
+                s3_client.upload_file(video_path, S3_BUCKET, s3_key)
+                print(f"worker-comfyui - Upload complete: {filename} -> s3://{S3_BUCKET}/{s3_key}")
                 output_data.append({
                     "filename": filename,
-                    "type": "local_path",
-                    "data": video_path,
+                    "s3_key": s3_key,
+                    "bucket": S3_BUCKET,
                 })
+            except Exception as e:
+                error_msg = f"Error uploading {filename} to S3: {e}"
+                print(f"worker-comfyui - {error_msg}")
+                print(f"worker-comfyui - Upload traceback: {traceback.format_exc()}")
+                errors.append(error_msg)
 
     except websocket.WebSocketException as e:
         print(f"worker-comfyui - WebSocket Error: {e}")
